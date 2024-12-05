@@ -3,6 +3,10 @@
 data/
 predictions/
 catboost_info/
+.DS_Store
+*.zip
+
+not_needed_now/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

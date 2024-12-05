@@ -11,17 +11,13 @@ from catboost import CatBoostClassifier
 
 
 RANDOM_SEED = 42
-DATA_PATH = "./data"
-PREDICTION_PATH = "./predictions"
+DATA_PATH = "data"
+PREDICTION_PATH = "predictions"
 DEVICE = "CPU"
 
 
 def load_data(data_paths: list[str]) -> pd.DataFrame:
     data = pd.read_parquet(data_paths[0])
-    if len(data_paths) > 1:
-        for i in range(1, len(data_paths)):
-            data = pd.concat([data, pd.read_parquet(data_paths[i])])
-
     return data
 
 
@@ -31,63 +27,88 @@ def train_preprocess(
     corr_sample=500000, corr_threshold=0.98
 ):
     data = load_data(train_paths)
-    len_data = len(data)
+    data = data.reset_index(drop=True)
     print(f"-- Data has shape: {data.shape}")
 
-    target = data[['target']].astype('int8')
-    data = data.drop(['smpl', 'id', 'target'], axis=1, errors='ignore')
-    print("-- Dropped target, smpl and id")
+    data = data.drop(['smpl', 'id'], axis=1, errors='ignore')
+    print("-- Dropped smpl and id")
 
     # Change float64 to float16
-    float_cols = list(data.loc[:5, data.dtypes == 'float64'].columns)
+    float_cols = list(data.loc[:, data.dtypes == 'float64'].columns)
     data[float_cols] = data[float_cols].astype('float16')
     print("-- Converted columns to float16")
 
     # Remove duplicates
-    if data.duplicated().sum() > 0:
+    tmp = data.duplicated().sum()
+    if tmp > 0:
         data = data.drop_duplicates().reset_index(drop=True)
-    print("-- Removed duplicates")
+        print(f"-- Removed {tmp} duplicates")
+    else:
+        print('-- no duplicates')
+
+    target = data[['target']].astype('int8')
+    data = data.drop(['target'], axis=1, errors='ignore')
+    print("-- Dropped target")
 
     # Remove high nan cols
     if data.isna().sum().sum() > 0:
-        na_threshold = len_data * nan_threshold
+        na_threshold = len(data) * nan_threshold
+        tmp = data.shape[1]
         data = data.loc[:, data.isna().sum() < na_threshold]
-    print("-- Removed high nan cols")
+        tmp -= data.shape[1]
+        print(f"-- Removed {tmp} high nan cols")
+    else:
+        print('-- no nan cols')
 
     # Remove near const cols
     to_drop = []
+    tmp = data.shape[1]
     for i in data.columns:
         if data[i].value_counts(normalize=True).values[0] > const_threshold:
             to_drop.append(i)
     if len(to_drop) > 0:
         data = data.drop(to_drop, axis=1)
-    print("-- Removed high const cols")
+    tmp -= data.shape[1]
+    if tmp == 0:
+        print('-- no high const cols')
+    else:
+        print(f"-- Removed {tmp} high const cols")
 
     # Remove high corr cols
-    if len_data > corr_sample:
+    tmp = data.shape[1]
+    if len(data) > corr_sample:
         corr_matrix = data.sample(corr_sample).corr(numeric_only=True).abs()
     else:
         corr_matrix = data.corr(numeric_only=True).abs()
 
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
     to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
-    data = data.drop(to_drop, axis=1)
-    print("-- Removed high corr cols")
+    data = data.drop(to_drop, axis=1, errors='ignore')
+    tmp -= data.shape[1]
+    
+    if tmp == 0:
+        print('-- no high corr cols')
+    else:
+        print(f"-- Removed {tmp} high corr cols")
 
     # Change cat dtypes
     n_un_df = data.nunique().reset_index()
     n_un_df.columns = ['col', 'n_un']
 
     bin_cols = list(n_un_df[n_un_df['n_un'] == 2]['col'])
-    cat_cols = list(n_un_df[(n_un_df['n_un'] > 2) & (n_un_df['n_un'] < 1000)]['col'])
+    cat_length = min(1000, int(len(data) * 0.2))
+    cat_cols = list(n_un_df[(n_un_df['n_un'] > 2) & (n_un_df['n_un'] < cat_length)]['col'])
 
     data[bin_cols] = data[bin_cols].astype(bool)
-    data[cat_cols] = data[cat_cols].astype(str)
+    data[cat_cols] = data[cat_cols].astype('int8')
     print("-- Converted categorical cols to needed types")
 
     # OHE
+    tmp = data.shape[1]
     data = pd.get_dummies(data, columns=cat_cols)
-    print("-- OneHotEncoding for categorical data")
+    tmp = data.shape[1] - tmp
+    print(f"-- Added {tmp} cols after OneHotEncoding")
+    print(f'-- Total amount of cols {data.shape[1]}')
 
     res = {
         "data": data,
@@ -103,9 +124,16 @@ def feature_selection(
     mode: str = 'hybrid',
     max_features: int = 500
 ) -> pd.DataFrame:
-    x_train, x_valid, y_train, y_valid = train_test_split(
-        data, y, test_size=0.1, stratify=y, random_state=RANDOM_SEED
-    )
+    tmp = data.shape[1]
+
+    if y.value_counts().min() == 1:
+        x_train = x_valid = data
+        y_train = y_valid = y
+    else:
+        x_train, x_valid, y_train, y_valid = train_test_split(
+            data, y, test_size=0.1, stratify=y, random_state=RANDOM_SEED
+        )
+
     print("** Fitting model for feature selection...")
     model = CatBoostClassifier(
         learning_rate=0.1, iterations=10000, eval_metric='AUC', early_stopping_rounds=50,
@@ -130,19 +158,26 @@ def feature_selection(
         top_features = list(imp[imp['shap_value'] > 1e-5]['name'])
 
     data = data[top_features]
-
+    
+    tmp -= data.shape[1]
+    print(f'** Deleted {tmp} cols after feature selection')
+    print(f'** Total amount of cols after feature selection {data.shape[1]}')
     return data
 
 
 def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
-    if len(x) > 500_000:
+    if len(x) > 1_000_000:
         ts = 0.1
     else:
         ts = 0.2
 
-    x_train, x_valid, y_train, y_valid = train_test_split(
-        x, y, stratify=y, test_size=ts, random_state=RANDOM_SEED
-    )
+    if y.value_counts().min() == 1:
+        x_train = x_valid = x
+        y_train = y_valid = y
+    else:
+        x_train, x_valid, y_train, y_valid = train_test_split(
+            x, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
+        )
 
     print("++ Training with early_stopping...")
     model = CatBoostClassifier(
@@ -157,12 +192,15 @@ def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
 
     best_iter = model.best_iteration_ + 1
 
-    print(f"++ Training with all data, best_iter: {best_iter}...")
-    model = CatBoostClassifier(
-        iterations=best_iter, learning_rate=0.1, eval_metric='AUC',
-        verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
-    )
-    model.fit(x, y)
+    if len(x) < 2_000_000:
+        print(f"++ Training with all data, best_iter: {best_iter} ...")
+        model = CatBoostClassifier(
+            iterations=best_iter, learning_rate=0.1, eval_metric='AUC',
+            verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
+        )
+        model.fit(x, y)
+    else:
+        print(f"++ Not training with all data, x_length is {len(x)}")
 
     return model, roc_auc_validation
 
@@ -261,6 +299,7 @@ def modelling(dataset_folder: str) -> tuple[pd.DataFrame, float]:
 
 def main():
     # Запишем список датасетов в папке:
+    print(f"Calculating with {DEVICE}")
     datasets_folders = os.listdir(DATA_PATH)
 
     if len(datasets_folders) == 0:
@@ -272,9 +311,14 @@ def main():
     # Calculate total time
     total_time = 0
     total_roc_auc = 0.0
+    num_valid_datasets = 0
 
     # Создадим цикл для прохождения по каждому файлу и генерации предсказания
     for dataset_folder in datasets_folders:
+        if not os.path.isdir(os.path.join(DATA_PATH, dataset_folder)):
+            print(f"Skipped {dataset_folder} (not a directory)")
+            continue
+
         start_time = time.time()
         prediction, roc_auc_val = modelling(dataset_folder)
         total_roc_auc += roc_auc_val
@@ -284,11 +328,12 @@ def main():
 
         dataset_time = time.time() - start_time
         total_time += dataset_time
+        num_valid_datasets += 1
         print(f"Prediction is saved! Dataset time: {dataset_time}")
         print("\n================================")
 
     print(f"All datasets are done! Total time: {total_time}")
-    print(f"Total ROC-AUC: {total_roc_auc / len(datasets_folders)}")
+    print(f"Average ROC-AUC between all the datasets: {total_roc_auc / num_valid_datasets}")
 
 
 if __name__ == "__main__":
