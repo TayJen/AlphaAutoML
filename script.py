@@ -178,6 +178,8 @@ def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
         ts = 0.2
 
     is_needed_full_training = False
+    depth = 6
+
     if y.value_counts().min() == 1:
         print(f"++ Training without early_stopping (total number of rows: {len(x)}...")
         model = CatBoostClassifier(
@@ -192,11 +194,39 @@ def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
         )
 
         print("++ Training with early_stopping...")
-        model = CatBoostClassifier(
+        model_base = CatBoostClassifier(
             iterations=10_000, learning_rate=0.1, eval_metric='AUC', early_stopping_rounds=50,
             verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
         )
-        model.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        model_base.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        model_base_best_score = model_base.best_score_['validation']['AUC']
+
+        model_medium = CatBoostClassifier(
+            depth=8, iterations=10_000, learning_rate=0.03, eval_metric='AUC', early_stopping_rounds=50,
+            verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
+        )
+        model_medium.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        model_medium_best_score = model_medium.best_score_['validation']['AUC']
+
+        model_huge = CatBoostClassifier(
+            depth=10, iterations=10_000, learning_rate=0.01, eval_metric='AUC', early_stopping_rounds=50,
+            verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
+        )
+        model_huge.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        model_huge_best_score = model_huge.best_score_['validation']['AUC']
+
+        best_score = max(model_base_best_score, model_medium_best_score, model_huge_best_score)
+        if best_score == model_base_best_score:
+            model = model_base
+        elif best_score == model_medium_best_score:
+            model = model_medium
+            depth = 8
+        else:
+            model = model_huge
+            depth = 10
+        print(f"++ The best is the model with depth {depth}")
+        print(f"++ The scores were {model_base_best_score:.3f}, {model_medium_best_score:.3f}, {model_huge_best_score:.3f}")
+
         is_needed_full_training = True
 
     y_pred = model.predict_proba(x_valid)[:, 1]
@@ -208,7 +238,7 @@ def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
 
         print(f"++ Training with all data, best_iter: {best_iter} ...")
         model = CatBoostClassifier(
-            iterations=best_iter, learning_rate=0.1, eval_metric='AUC',
+            depth=depth, iterations=best_iter, learning_rate=0.1, eval_metric='AUC',
             verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
         )
         model.fit(x, y)
