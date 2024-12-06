@@ -13,7 +13,8 @@ from catboost import CatBoostClassifier
 RANDOM_SEED = 42
 DATA_PATH = "data"
 PREDICTION_PATH = "predictions"
-DEVICE = "CPU"
+# DEVICE = "CPU"
+DEVICE = "GPU"
 
 
 def load_data(data_paths: list[str]) -> pd.DataFrame:
@@ -127,19 +128,24 @@ def feature_selection(
     tmp = data.shape[1]
 
     if y.value_counts().min() == 1:
-        x_train = x_valid = data
-        y_train = y_valid = y
+        print(f"** Fitting model for feature selection without early_stopping (total number of rows: {len(data)}...")
+        model = CatBoostClassifier(
+            learning_rate=0.1, verbose=False, random_state=RANDOM_SEED
+        )
+        model.fit(data, y)
+
+        x_valid = data
     else:
         x_train, x_valid, y_train, y_valid = train_test_split(
             data, y, test_size=0.1, stratify=y, random_state=RANDOM_SEED
         )
 
-    print("** Fitting model for feature selection...")
-    model = CatBoostClassifier(
-        learning_rate=0.1, iterations=10000, eval_metric='AUC', early_stopping_rounds=50,
-        verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
-    )
-    model.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        print("** Fitting model for feature selection with early_stopping...")
+        model = CatBoostClassifier(
+            learning_rate=0.1, iterations=10000, eval_metric='AUC', early_stopping_rounds=50,
+            verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
+        )
+        model.fit(x_train, y_train, eval_set=(x_valid, y_valid))
 
     print("** Calculating SHAP values...")
     explainer = shap.TreeExplainer(model)
@@ -171,28 +177,35 @@ def train(x: pd.DataFrame, y: pd.Series) -> tuple[CatBoostClassifier, float]:
     else:
         ts = 0.2
 
+    is_needed_full_training = False
     if y.value_counts().min() == 1:
-        x_train = x_valid = x
-        y_train = y_valid = y
+        print(f"++ Training without early_stopping (total number of rows: {len(x)}...")
+        model = CatBoostClassifier(
+            learning_rate=0.1, verbose=False, random_state=RANDOM_SEED
+        )
+        model.fit(x, y)
+
+        x_valid, y_valid = x, y
     else:
         x_train, x_valid, y_train, y_valid = train_test_split(
             x, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
         )
 
-    print("++ Training with early_stopping...")
-    model = CatBoostClassifier(
-        iterations=10_000, learning_rate=0.1, eval_metric='AUC', early_stopping_rounds=50,
-        verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
-    )
-    model.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        print("++ Training with early_stopping...")
+        model = CatBoostClassifier(
+            iterations=10_000, learning_rate=0.1, eval_metric='AUC', early_stopping_rounds=50,
+            verbose=False, task_type=DEVICE, random_state=RANDOM_SEED
+        )
+        model.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        is_needed_full_training = True
 
     y_pred = model.predict_proba(x_valid)[:, 1]
     roc_auc_validation = roc_auc_score(y_valid, y_pred)
     print(f"++ ROC-AUC on validation is {roc_auc_validation:.5f}")
 
-    best_iter = model.best_iteration_ + 1
+    if is_needed_full_training and len(x) < 2_000_000:
+        best_iter = model.best_iteration_ + 1
 
-    if len(x) < 2_000_000:
         print(f"++ Training with all data, best_iter: {best_iter} ...")
         model = CatBoostClassifier(
             iterations=best_iter, learning_rate=0.1, eval_metric='AUC',
