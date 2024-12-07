@@ -1,5 +1,6 @@
 import time
 
+import optuna
 import pandas as pd
 import numpy as np
 import os
@@ -7,16 +8,24 @@ import shap
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 from sklearn.model_selection import train_test_split
 from catboost import CatBoostClassifier
 from sklearn.svm import SVC
+from sklearn.utils.class_weight import compute_class_weight
+from xgboost import XGBClassifier
+
 
 RANDOM_SEED = 42
+
 DATA_PATH = "data"
 PREDICTION_PATH = "predictions"
+
 # DEVICE = "CPU"
 DEVICE = "GPU"
+# DEVICE_XGB = "cpu"
+DEVICE_XGB = "cuda"
 DEVICE_VERY_SMALL = "CPU"
 DEVICE_LIGHTGBM = "cpu"
 
@@ -32,7 +41,7 @@ def load_data(data_paths: list[str]) -> pd.DataFrame:
 
 def train_preprocess(
     train_paths: list[str],
-    nan_threshold=0.98, const_threshold=0.98,
+    nan_threshold=0.98,
     corr_sample=500000, corr_threshold=0.98
 ):
     data = load_data(train_paths)
@@ -44,7 +53,7 @@ def train_preprocess(
 
     # Change float64 to float16
     float_cols = list(data.loc[:, data.dtypes == 'float64'].columns)
-    data[float_cols] = data[float_cols].astype('float32')   # float32?
+    data[float_cols] = data[float_cols].astype('float16')   # float32?
     print("-- Converted columns to float16")
 
     # Remove duplicates
@@ -68,20 +77,6 @@ def train_preprocess(
         print(f"-- Removed {tmp} high nan cols")
     else:
         print('-- no nan cols')
-
-    # Remove near const cols
-    # to_drop = []
-    # tmp = data.shape[1]
-    # for i in data.columns:
-    #     if data[i].value_counts(normalize=True).values[0] > const_threshold:
-    #         to_drop.append(i)
-    # if len(to_drop) > 0:
-    #     data = data.drop(to_drop, axis=1)
-    # tmp -= data.shape[1]
-    # if tmp == 0:
-    #     print('-- no high const cols')
-    # else:
-    #     print(f"-- Removed {tmp} high const cols")
 
     # Remove high corr cols
     tmp = data.shape[1]
@@ -194,6 +189,7 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
     X_std = None
 
     y = y.values.ravel()
+    class_weights = compute_class_weight('balanced', classes=np.array([0, 1]), y=y)
 
     if data_size_type == "very_small":
         X_values = X.to_numpy(na_value=0.0, dtype=np.float32)
@@ -203,28 +199,35 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         X_values = (X_values - X_mean) / X_std
 
         model_svm = SVC(
-            max_iter=10000, tol=1e-7, C=1e-5, kernel='linear',
+            max_iter=10000, tol=1e-7, C=1e-5, kernel='linear', class_weight="balanced",
             probability=True, verbose=False, random_state=RANDOM_SEED
         )
         model_svm.fit(X_values, y)
 
         model_logreg = LogisticRegression(
-            max_iter=10000, C=1e-5, solver='liblinear',
+            max_iter=10000, C=1e-5, solver='liblinear', class_weight="balanced",
             verbose=False, random_state=RANDOM_SEED, n_jobs=-1
         )
         model_logreg.fit(X_values, y)
 
         model_random_forest = RandomForestClassifier(
-            n_estimators=300, n_jobs=-1,
+            n_estimators=300, n_jobs=-1, class_weight="balanced",
             verbose=False, random_state=RANDOM_SEED
         )
         model_random_forest.fit(X, y)
 
         model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM,
+            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, is_unbalance=True,
             verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
         )
         model_lightgbm.fit(X, y)
+
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1
+        )
+        model_xgboost.fit(X, y)
 
         model_catboost = CatBoostClassifier(
             learning_rate=0.1, task_type=DEVICE_VERY_SMALL,
@@ -237,53 +240,101 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             "logreg": model_logreg,
             "random_forest": model_random_forest,
             "lightgbm": model_lightgbm,
+            "xgboost": model_xgboost,
             "catboost": model_catboost
         }
 
     elif data_size_type == "small":
         X_values = X.to_numpy(na_value=0.0, dtype=np.float32)
 
-        X_mean = np.mean(X_values, axis=0)
-        X_std = np.std(X_values, axis=0) + 1e-8
+        x_train, x_valid, y_train, y_valid = train_test_split(
+            X_values, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
+        )
 
-        X_values = (X_values - X_mean) / X_std
+        X_mean = np.mean(x_train, axis=0)
+        X_std = np.std(x_train, axis=0) + 1e-8
 
+        x_train_normalized = (x_train - X_mean) / X_std
+        x_valid_normalized = (x_valid - X_mean) / X_std
+
+        X_mean_full = np.mean(X_values, axis=0)
+        X_std_full = np.std(X_values, axis=0) + 1e-8
+        x_full_normalized = (X_values - X_mean_full) / X_std_full
+
+        # SVM
         model_svm = SVC(
-            max_iter=10000, tol=1e-7, C=1e-5, kernel='linear',
+            max_iter=10000, tol=1e-7, C=1e-5, kernel='linear', class_weight="balanced",
             probability=True, verbose=False, random_state=RANDOM_SEED
         )
-        model_svm.fit(X_values, y)
+        model_svm.fit(x_train_normalized, y_train)
+        pred_svm = model_svm.predict_proba(x_valid_normalized)[:, 1]
 
+        model_svm = SVC(
+            max_iter=10000, tol=1e-7, C=1e-5, kernel='linear', class_weight="balanced",
+            probability=True, verbose=False, random_state=RANDOM_SEED
+        )
+        model_svm.fit(x_full_normalized, y)
+
+        # Logistic Regression
         model_logreg = LogisticRegression(
-            max_iter=10000, C=1e-5, solver='liblinear',
+            solver='liblinear', class_weight="balanced",
             verbose=False, random_state=RANDOM_SEED, n_jobs=-1
         )
-        model_logreg.fit(X_values, y)
+        model_logreg.fit(x_train_normalized, y_train)
+        pred_logreg = model_logreg.predict_proba(x_valid_normalized)[:, 1]
 
+        model_logreg = LogisticRegression(
+            solver='liblinear', class_weight="balanced",
+            verbose=False, random_state=RANDOM_SEED, n_jobs=-1
+        )
+        model_logreg.fit(x_full_normalized, y)
+
+        # Random Forest
         model_random_forest = RandomForestClassifier(
-            n_estimators=300, n_jobs=-1,
+            n_estimators=300, n_jobs=-1, class_weight="balanced",
             verbose=False, random_state=RANDOM_SEED
         )
-        model_random_forest.fit(X, y)
+        model_random_forest.fit(x_train, y_train)
+        pred_random_forest = model_random_forest.predict_proba(x_valid_normalized)[:, 1]
 
-        x_train, x_valid, y_train, y_valid = train_test_split(
-            X, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
+        model_random_forest = RandomForestClassifier(
+            n_estimators=300, n_jobs=-1, class_weight="balanced",
+            verbose=False, random_state=RANDOM_SEED
         )
+        model_random_forest.fit(X_values, y)
 
-        # LightGBM early stopping training
+        # LightGBM
         model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50,
+            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50, is_unbalance=True,
             verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
         )
         model_lightgbm.fit(x_train, y_train, eval_set=(x_valid, y_valid), eval_metric='auc')
         lgbm_best_iter = model_lightgbm.best_iteration_
+        pred_lightgbm = model_lightgbm.predict_proba(x_valid)[:, 1]
 
-        # LightGBM full training
         model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, n_estimators=lgbm_best_iter,
+            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, n_estimators=lgbm_best_iter, is_unbalance=True,
             verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
         )
-        model_lightgbm.fit(X, y)
+        model_lightgbm.fit(X_values, y)
+
+        # XGBoost early stopping training
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB, eval_metric="auc", early_stopping_rounds=50,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1
+        )
+        model_xgboost.fit(x_train, y_train, eval_set=[(x_valid, y_valid)], verbose=False)
+        xgboost_best_iter = model_xgboost.get_booster().best_iteration
+        pred_xgboost = model_xgboost.predict_proba(x_valid)[:, 1]
+
+        # XGBoost full training
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB, n_estimators=xgboost_best_iter,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1
+        )
+        model_xgboost.fit(X_values, y, verbose=False)
 
         # Catboost early stopping training
         model_catboost = CatBoostClassifier(
@@ -292,20 +343,28 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost.fit(x_train, y_train, eval_set=(x_valid, y_valid))
         catboost_best_iter = model_catboost.best_iteration_ + 1
+        pred_catboost = model_catboost.predict_proba(x_valid)[:, 1]
 
         # Catboost full training
         model_catboost = CatBoostClassifier(
             learning_rate=0.1, task_type=DEVICE, n_estimators=catboost_best_iter,
             verbose=False, random_state=RANDOM_SEED
         )
-        model_catboost.fit(X, y)
+        model_catboost.fit(X_values, y)
+
+        optuna_coeffs = small_optuna_blender(
+            y_valid, svm_preds=pred_svm, logreg_preds=pred_logreg, random_forest_preds=pred_random_forest,
+            lightgbm_preds=pred_lightgbm, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost
+        )
 
         models = {
             "svm": model_svm,
             "logreg": model_logreg,
             "random_forest": model_random_forest,
             "lightgbm": model_lightgbm,
-            "catboost": model_catboost
+            "xgboost": model_xgboost,
+            "catboost": model_catboost,
+            "optuna_coeffs": optuna_coeffs
         }
 
     elif data_size_type == "medium":
@@ -313,20 +372,38 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             X, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
         )
 
-        # LightGBM early stopping training
-        model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50,
-            verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
-        )
-        model_lightgbm.fit(x_train, y_train, eval_set=(x_valid, y_valid), eval_metric='auc')
-        lgbm_best_iter = model_lightgbm.best_iteration_
+        # # LightGBM early stopping training
+        # model_lightgbm = LGBMClassifier(
+        #     learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50, is_unbalance=True,
+        #     verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
+        # )
+        # model_lightgbm.fit(x_train, y_train, eval_set=(x_valid, y_valid), eval_metric='auc')
+        # lgbm_best_iter = model_lightgbm.best_iteration_
+        #
+        # # LightGBM full training
+        # model_lightgbm = LGBMClassifier(
+        #     learning_rate=0.1, device_type=DEVICE_LIGHTGBM, n_estimators=lgbm_best_iter, is_unbalance=True,
+        #     verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
+        # )
+        # model_lightgbm.fit(X, y)
 
-        # LightGBM full training
-        model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, n_estimators=lgbm_best_iter,
-            verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
+        # XGBoost early stopping training
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB, eval_metric="auc", early_stopping_rounds=50,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1,
         )
-        model_lightgbm.fit(X, y)
+        model_xgboost.fit(x_train, y_train, eval_set=[(x_valid, y_valid)], verbose=False)
+        xgboost_best_iter = model_xgboost.get_booster().best_iteration
+        pred_xgboost = model_xgboost.predict_proba(x_valid)[:, 1]
+
+        # XGBoost full training
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB, n_estimators=xgboost_best_iter,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1,
+        )
+        model_xgboost.fit(X, y, verbose=False)
 
         # Catboost early stopping training
         model_catboost = CatBoostClassifier(
@@ -335,6 +412,7 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost.fit(x_train, y_train, eval_set=(x_valid, y_valid))
         catboost_best_iter = model_catboost.best_iteration_ + 1
+        pred_catboost = model_catboost.predict_proba(x_valid)[:, 1]
 
         # Catboost full training
         model_catboost = CatBoostClassifier(
@@ -343,9 +421,12 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost.fit(X, y)
 
+        optuna_coeffs = big_optuna_blender(y_valid, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost)
+
         models = {
-            "lightgbm": model_lightgbm,
-            "catboost": model_catboost
+            "xgboost": model_xgboost,
+            "catboost": model_catboost,
+            "optuna_coeffs": optuna_coeffs
         }
 
     else:
@@ -353,12 +434,21 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             X, y, test_size=ts, stratify=y, random_state=RANDOM_SEED
         )
 
-        # LightGBM early stopping training
-        model_lightgbm = LGBMClassifier(
-            learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50,
-            verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
+        # # LightGBM early stopping training
+        # model_lightgbm = LGBMClassifier(
+        #     learning_rate=0.1, device_type=DEVICE_LIGHTGBM, early_stopping_round=50, is_unbalance=True,
+        #     verbose=-1, random_state=RANDOM_SEED, n_jobs=-1
+        # )
+        # model_lightgbm.fit(x_train, y_train, eval_set=(x_valid, y_valid), eval_metric='auc')
+
+        # XGBoost early stopping training
+        model_xgboost = XGBClassifier(
+            learning_rate=0.1, device=DEVICE_XGB, eval_metric="auc", early_stopping_rounds=50,
+            scale_pos_weight=class_weights[1] / class_weights[0],
+            verbosity=0, random_state=RANDOM_SEED, n_jobs=-1,
         )
-        model_lightgbm.fit(x_train, y_train, eval_set=(x_valid, y_valid), eval_metric='auc')
+        model_xgboost.fit(x_train, y_train, eval_set=[(x_valid, y_valid)], verbose=False)
+        pred_xgboost = model_xgboost.predict_proba(x_valid)[:, 1]
 
         # Catboost early stopping training
         model_catboost = CatBoostClassifier(
@@ -366,10 +456,14 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             verbose=False, random_state=RANDOM_SEED
         )
         model_catboost.fit(x_train, y_train, eval_set=(x_valid, y_valid))
+        pred_catboost = model_catboost.predict_proba(x_valid)[:, 1]
+
+        optuna_coeffs = big_optuna_blender(y_valid, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost)
 
         models = {
-            "lightgbm": model_lightgbm,
-            "catboost": model_catboost
+            "xgboost": model_xgboost,
+            "catboost": model_catboost,
+            "optuna_coeffs": optuna_coeffs
         }
 
     res = {
@@ -379,6 +473,106 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
     }
 
     return res
+
+
+def small_optuna_blender(
+    y_valid: np.ndarray,
+    svm_preds: np.ndarray,
+    logreg_preds: np.ndarray,
+    random_forest_preds: np.ndarray,
+    lightgbm_preds: np.ndarray,
+    xgboost_preds: np.ndarray,
+    catboost_preds: np.ndarray
+) -> dict[str, float]:
+    def objective(trial):
+        svm = trial.suggest_float("svm", 0, 1, step=0.01)
+        logreg = trial.suggest_float("logreg", 0, 1, step=0.01)
+        random_forest = trial.suggest_float("random_forest", 0, 1, step=0.01)
+        lightgbm = trial.suggest_float("lightgbm", 0, 1, step=0.01)
+        xgboost = trial.suggest_float("xgboost", 0, 1, step=0.01)
+        catboost = trial.suggest_float("catboost", 0, 1, step=0.01)
+
+        s = svm + logreg + random_forest + lightgbm + xgboost + catboost
+
+        if s == 0:
+            return 0
+        else:
+            svm_normed = svm / s
+            logreg_normed = logreg / s
+            random_forest_normed = random_forest / s
+            lightgbm_normed = lightgbm / s
+            xgboost_normed = xgboost / s
+            catboost_normed = catboost / s
+
+            new_probs = (
+                svm_preds * svm_normed +
+                logreg_preds * logreg_normed +
+                random_forest_preds * random_forest_normed +
+                lightgbm_preds * lightgbm_normed +
+                xgboost_preds * xgboost_normed +
+                catboost_preds * catboost_normed
+            )
+
+            return roc_auc_score(y_valid, new_probs)
+
+    tpe_sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
+    study = optuna.create_study(direction='maximize', sampler=tpe_sampler)
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 1})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 1, 'catboost': 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 1, 'xgboost': 0, 'catboost': 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 1, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 1, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0})
+    study.enqueue_trial({'svm': 1, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0})
+    study.enqueue_trial({'svm': 1, 'logreg': 1, 'random_forest': 1, 'lightgbm': 1, 'xgboost': 1, 'catboost': 1})
+    study.optimize(objective, n_trials=100)
+
+    coefs = study.best_params
+
+    sum_coefs = sum(coefs.values())
+
+    coefs['svm'] /= sum_coefs
+    coefs['logreg'] /= sum_coefs
+    coefs['random_forest'] /= sum_coefs
+    coefs['lightgbm'] /= sum_coefs
+    coefs['xgboost'] /= sum_coefs
+    coefs['catboost'] /= sum_coefs
+
+    return coefs
+
+
+def big_optuna_blender(
+    y_valid: np.ndarray, xgboost_preds: np.ndarray, catboost_preds: np.ndarray
+) -> dict[str, float]:
+    def objective(trial):
+        xgboost = trial.suggest_float("xgboost", 0, 1, step=0.01)
+        catboost = trial.suggest_float("catboost", 0, 1, step=0.01)
+
+        s = xgboost + catboost
+
+        if s == 0:
+            return 0
+        else:
+            xgboost_normed = xgboost / s
+            catboost_normed = catboost / s
+            new_probs = xgboost_preds * xgboost_normed + catboost_preds * catboost_normed
+
+            return roc_auc_score(y_valid, new_probs)
+
+    tpe_sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
+    study = optuna.create_study(direction='maximize', sampler=tpe_sampler)
+    study.enqueue_trial({'xgboost': 0, "catboost": 1})
+    study.enqueue_trial({'xgboost': 1, "catboost": 0})
+    study.enqueue_trial({'xgboost': 1, "catboost": 1})
+    study.optimize(objective, n_trials=100)
+
+    coefs = study.best_params
+
+    sum_coefs = sum(coefs.values())
+
+    coefs['xgboost'] /= sum_coefs
+    coefs['catboost'] /= sum_coefs
+
+    return coefs
 
 
 def test_preprocess(
@@ -422,7 +616,7 @@ def predict(
     y_pred = []
     models = train_model_res["models"]
 
-    if len(models) > 2:
+    if "svm" in models:
         X_mean = train_model_res["X_mean"]
         X_std = train_model_res["X_std"]
 
@@ -438,15 +632,31 @@ def predict(
         random_forest_model = models["random_forest"]
         y_pred.append(random_forest_model.predict_proba(test_data)[:, 1])
 
-    lightgbm_model = models["lightgbm"]
-    y_pred.append(lightgbm_model.predict_proba(test_data)[:, 1])
+        lightgbm_model = models["lightgbm"]
+        y_pred.append(lightgbm_model.predict_proba(test_data)[:, 1])
+
+    xgboost_model = models["xgboost"]
+    y_pred.append(xgboost_model.predict_proba(test_data)[:, 1])
 
     catboost_model = models["catboost"]
     y_pred.append(catboost_model.predict_proba(test_data)[:, 1])
 
-    # print(y_pred)
-    y_pred = np.mean(y_pred, axis=0)
-    # print(y_pred)
+    print(models.get("optuna_coeffs", "HAHA"))
+    if "optuna_coeffs" in models and len(models["optuna_coeffs"]) == 2:
+        y_pred = y_pred[0] * models["optuna_coeffs"]["xgboost"] + y_pred[1] * models["optuna_coeffs"]["catboost"]
+    elif "optuna_coeffs" in models:
+        y_pred = (
+                y_pred[0] * models["optuna_coeffs"]["svm"] +
+                y_pred[1] * models["optuna_coeffs"]["logreg"] +
+                y_pred[2] * models["optuna_coeffs"]["random_forest"] +
+                y_pred[3] * models["optuna_coeffs"]["lightgbm"] +
+                y_pred[4] * models["optuna_coeffs"]["xgboost"] +
+                y_pred[5] * models["optuna_coeffs"]["catboost"]
+        )
+    else:
+        y_pred = np.mean(y_pred, axis=0)
+
+    print(y_pred)
 
     submit_data['target'] = y_pred
 
