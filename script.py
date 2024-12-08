@@ -240,6 +240,11 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost_x2.fit(X, y)
 
+        model_catboost_x3 = CatBoostClassifier(
+            learning_rate=0.08, task_type=DEVICE_VERY_SMALL, verbose=False, random_state=RANDOM_SEED + 2
+        )
+        model_catboost_x3.fit(X, y)
+
         models = {
             "svm": model_svm,
             "logreg": model_logreg,
@@ -247,7 +252,8 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             "lightgbm": model_lightgbm,
             "xgboost": model_xgboost,
             "catboost": model_catboost,
-            "catboost_x2": model_catboost_x2
+            "catboost_x2": model_catboost_x2,
+            "catboost_x3": model_catboost_x3
         }
 
     elif data_size_type == "small":
@@ -375,10 +381,25 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost_x2.fit(full_pool)
 
+        # Catboost x3
+        model_catboost_x3 = CatBoostClassifier(
+            depth=7, learning_rate=0.025, task_type=DEVICE, eval_metric='AUC', iterations=10000,
+            early_stopping_rounds=50, verbose=False, random_state=RANDOM_SEED + 2
+        )
+        model_catboost_x3.fit(train_pool, eval_set=eval_pool)
+        catboost_x3_best_iter = model_catboost_x3.best_iteration_ + 1
+        pred_catboost_x3 = model_catboost_x3.predict_proba(x_valid)[:, 1]
+
+        model_catboost_x3 = CatBoostClassifier(
+            depth=7, learning_rate=0.025, task_type=DEVICE, iterations=catboost_x3_best_iter,
+            verbose=False, random_state=RANDOM_SEED + 2
+        )
+        model_catboost_x3.fit(full_pool)
+
         optuna_coeffs = small_optuna_blender(
             y_valid, svm_preds=pred_svm, logreg_preds=pred_logreg, random_forest_preds=pred_random_forest,
             lightgbm_preds=pred_lightgbm, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost,
-            catboost_x2_preds=pred_catboost_x2
+            catboost_x2_preds=pred_catboost_x2, catboost_x3_preds=pred_catboost_x3
         )
 
         models = {
@@ -389,6 +410,7 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
             "xgboost": model_xgboost,
             "catboost": model_catboost,
             "catboost_x2": model_catboost_x2,
+            "catboost_x3": model_catboost_x3,
             "optuna_coeffs": optuna_coeffs
         }
 
@@ -449,17 +471,34 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         )
         model_catboost_x2.fit(full_pool)
 
+        # Catboost x3
+        model_catboost_x3 = CatBoostClassifier(
+            depth=8, learning_rate=0.03, task_type=DEVICE, eval_metric='AUC', iterations=10000, early_stopping_rounds=50,
+            verbose=False, random_state=RANDOM_SEED+2
+        )
+        model_catboost_x3.fit(train_pool, eval_set=eval_pool)
+        catboost_x3_best_iter = model_catboost_x3.best_iteration_ + 1
+        pred_catboost_x3 = model_catboost_x3.predict_proba(x_valid)[:, 1]
+
+        model_catboost_x3 = CatBoostClassifier(
+            depth=8, learning_rate=0.03, task_type=DEVICE, iterations=catboost_x3_best_iter,
+            verbose=False, random_state=RANDOM_SEED+2
+        )
+        model_catboost_x3.fit(full_pool)
+
         optuna_coeffs = big_optuna_blender(
             y_valid,
             xgboost_preds=pred_xgboost,
             catboost_preds=pred_catboost,
-            catboost_x2_preds=pred_catboost_x2
+            catboost_x2_preds=pred_catboost_x2,
+            catboost_x3_preds=pred_catboost_x3
         )
 
         models = {
             "xgboost": model_xgboost,
             "catboost": model_catboost,
             "catboost_x2": model_catboost_x2,
+            "catboost_x3": model_catboost_x3,
             "optuna_coeffs": optuna_coeffs
         }
 
@@ -496,14 +535,24 @@ def train(X: pd.DataFrame, y: pd.Series) -> dict:
         model_catboost_x2.fit(train_pool, eval_set=eval_pool)
         pred_catboost_x2 = model_catboost_x2.predict_proba(x_valid)[:, 1]
 
+        # Catboost x3 early stopping training
+        model_catboost_x3 = CatBoostClassifier(
+            depth=10, learning_rate=0.05, task_type=DEVICE, eval_metric='AUC', iterations=10000, early_stopping_rounds=50,
+            verbose=False, random_state=RANDOM_SEED + 2
+        )
+        model_catboost_x3.fit(train_pool, eval_set=eval_pool)
+        pred_catboost_x3 = model_catboost_x3.predict_proba(x_valid)[:, 1]
+
         optuna_coeffs = big_optuna_blender(
-            y_valid, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost, catboost_x2_preds=pred_catboost_x2
+            y_valid, xgboost_preds=pred_xgboost, catboost_preds=pred_catboost, catboost_x2_preds=pred_catboost_x2,
+            catboost_x3_preds=pred_catboost_x3
         )
 
         models = {
             "xgboost": model_xgboost,
             "catboost": model_catboost,
             "catboost_x2": model_catboost_x2,
+            "catboost_x3": model_catboost_x3,
             "optuna_coeffs": optuna_coeffs
         }
 
@@ -524,7 +573,8 @@ def small_optuna_blender(
     lightgbm_preds: np.ndarray,
     xgboost_preds: np.ndarray,
     catboost_preds: np.ndarray,
-    catboost_x2_preds: np.ndarray
+    catboost_x2_preds: np.ndarray,
+    catboost_x3_preds: np.ndarray
 ) -> dict[str, float]:
     def objective(trial):
         svm = trial.suggest_float("svm", 0, 1, step=0.01)
@@ -534,8 +584,9 @@ def small_optuna_blender(
         xgboost = trial.suggest_float("xgboost", 0, 1, step=0.01)
         catboost = trial.suggest_float("catboost", 0, 1, step=0.01)
         catboost_x2 = trial.suggest_float("catboost_x2", 0, 1, step=0.01)
+        catboost_x3 = trial.suggest_float("catboost_x3", 0, 1, step=0.01)
 
-        s = svm + logreg + random_forest + lightgbm + xgboost + catboost + catboost_x2
+        s = svm + logreg + random_forest + lightgbm + xgboost + catboost + catboost_x2 + catboost_x3
 
         if s == 0:
             return 0
@@ -547,6 +598,7 @@ def small_optuna_blender(
             xgboost_normed = xgboost / s
             catboost_normed = catboost / s
             catboost_x2_normed = catboost_x2 / s
+            catboost_x3_normed = catboost_x3 / s
 
             new_probs = (
                 svm_preds * svm_normed +
@@ -555,21 +607,23 @@ def small_optuna_blender(
                 lightgbm_preds * lightgbm_normed +
                 xgboost_preds * xgboost_normed +
                 catboost_preds * catboost_normed +
-                catboost_x2_preds * catboost_x2_normed
+                catboost_x2_preds * catboost_x2_normed +
+                catboost_x3_preds * catboost_x3_normed
             )
 
             return roc_auc_score(y_valid, new_probs)
 
     tpe_sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
     study = optuna.create_study(direction='maximize', sampler=tpe_sampler)
-    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 1, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 1, 'catboost': 0, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 1, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 1, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 0, 'logreg': 1, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 1, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0})
-    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 1})
-    study.enqueue_trial({'svm': 1, 'logreg': 1, 'random_forest': 1, 'lightgbm': 1, 'xgboost': 1, 'catboost': 1, "catboost_x2": 1})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 1, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 1, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 1, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 1, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 1, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 1, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 1, "catboost_x3": 0})
+    study.enqueue_trial({'svm': 0, 'logreg': 0, 'random_forest': 0, 'lightgbm': 0, 'xgboost': 0, 'catboost': 0, "catboost_x2": 0, "catboost_x3": 1})
+    study.enqueue_trial({'svm': 1, 'logreg': 1, 'random_forest': 1, 'lightgbm': 1, 'xgboost': 1, 'catboost': 1, "catboost_x2": 1, "catboost_x3": 1})
     study.optimize(objective, n_trials=100)
 
     coefs = study.best_params
@@ -583,19 +637,22 @@ def small_optuna_blender(
     coefs['xgboost'] /= sum_coefs
     coefs['catboost'] /= sum_coefs
     coefs['catboost_x2'] /= sum_coefs
+    coefs['catboost_x3'] /= sum_coefs
 
     return coefs
 
 
 def big_optuna_blender(
-    y_valid: np.ndarray, xgboost_preds: np.ndarray, catboost_preds: np.ndarray, catboost_x2_preds: np.ndarray
+    y_valid: np.ndarray, xgboost_preds: np.ndarray, catboost_preds: np.ndarray, catboost_x2_preds: np.ndarray,
+    catboost_x3_preds: np.ndarray
 ) -> dict[str, float]:
     def objective(trial):
         xgboost = trial.suggest_float("xgboost", 0, 1, step=0.01)
         catboost = trial.suggest_float("catboost", 0, 1, step=0.01)
         catboost_x2 = trial.suggest_float("catboost_x2", 0, 1, step=0.01)
+        catboost_x3 = trial.suggest_float("catboost_x3", 0, 1, step=0.01)
 
-        s = xgboost + catboost + catboost_x2
+        s = xgboost + catboost + catboost_x2 + catboost_x3
 
         if s == 0:
             return 0
@@ -603,20 +660,24 @@ def big_optuna_blender(
             xgboost_normed = xgboost / s
             catboost_normed = catboost / s
             catboost_x2_normed = catboost_x2 / s
+            catboost_x3_normed = catboost_x3 / s
             new_probs = (
                     xgboost_preds * xgboost_normed +
                     catboost_preds * catboost_normed +
-                    catboost_x2_preds * catboost_x2_normed
+                    catboost_x2_preds * catboost_x2_normed +
+                    catboost_x3_preds * catboost_x3_normed
             )
 
             return roc_auc_score(y_valid, new_probs)
 
     tpe_sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
     study = optuna.create_study(direction='maximize', sampler=tpe_sampler)
-    study.enqueue_trial({'xgboost': 0, "catboost": 1, "catboost_x2": 0})
-    study.enqueue_trial({'xgboost': 1, "catboost": 0, "catboost_x2": 0})
-    study.enqueue_trial({'xgboost': 0, "catboost": 0, "catboost_x2": 1})
-    study.enqueue_trial({'xgboost': 1, "catboost": 1, "catboost_x2": 1})
+    study.enqueue_trial({'xgboost': 0, "catboost": 1, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'xgboost': 1, "catboost": 0, "catboost_x2": 0, "catboost_x3": 0})
+    study.enqueue_trial({'xgboost': 0, "catboost": 0, "catboost_x2": 1, "catboost_x3": 0})
+    study.enqueue_trial({'xgboost': 0, "catboost": 0, "catboost_x2": 0, "catboost_x3": 1})
+    study.enqueue_trial({'xgboost': 1, "catboost": 1, "catboost_x2": 1, "catboost_x3": 1})
+
     study.optimize(objective, n_trials=100)
 
     coefs = study.best_params
@@ -626,6 +687,7 @@ def big_optuna_blender(
     coefs['xgboost'] /= sum_coefs
     coefs['catboost'] /= sum_coefs
     coefs['catboost_x2'] /= sum_coefs
+    coefs['catboost_x3'] /= sum_coefs
 
     return coefs
 
@@ -699,12 +761,16 @@ def predict(
     catboost_x2_model = models["catboost_x2"]
     y_pred.append(catboost_x2_model.predict_proba(test_data)[:, 1])
 
+    catboost_x3_model = models["catboost_x3"]
+    y_pred.append(catboost_x3_model.predict_proba(test_data)[:, 1])
+
     print(models.get("optuna_coeffs", "HAHA"))
-    if "optuna_coeffs" in models and len(models["optuna_coeffs"]) == 3:
+    if "optuna_coeffs" in models and len(models["optuna_coeffs"]) == 4:
         y_pred = (
                 y_pred[0] * models["optuna_coeffs"]["xgboost"] +
                 y_pred[1] * models["optuna_coeffs"]["catboost"] +
-                y_pred[2] * models["optuna_coeffs"]["catboost_x2"]
+                y_pred[2] * models["optuna_coeffs"]["catboost_x2"] +
+                y_pred[3] * models["optuna_coeffs"]["catboost_x3"]
         )
     elif "optuna_coeffs" in models:
         y_pred = (
@@ -714,7 +780,8 @@ def predict(
                 y_pred[3] * models["optuna_coeffs"]["lightgbm"] +
                 y_pred[4] * models["optuna_coeffs"]["xgboost"] +
                 y_pred[5] * models["optuna_coeffs"]["catboost"] +
-                y_pred[6] * models["optuna_coeffs"]["catboost_x2"]
+                y_pred[6] * models["optuna_coeffs"]["catboost_x2"] +
+                y_pred[7] * models["optuna_coeffs"]["catboost_x3"]
         )
     else:
         y_pred = np.mean(y_pred, axis=0)
